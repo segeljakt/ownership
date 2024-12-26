@@ -50,14 +50,6 @@ impl<'a, 'b> Printer<'a, 'b> {
         self.indent()
     }
 
-    fn local(&mut self, l: &Local) -> std::fmt::Result {
-        if l.mutable {
-            self.lit("mut")?;
-            self.space()?;
-        }
-        self.lit(&l.id)
-    }
-
     fn ty(&mut self, t: &Type) -> std::fmt::Result {
         match t {
             Type::Int => self.lit("i32"),
@@ -89,7 +81,7 @@ impl<'a, 'b> Printer<'a, 'b> {
                 self.ty(ty)
             }
             Type::RefMut(loans, ty) => {
-                self.lit("&mut")?;
+                self.lit("&")?;
                 self.lit("{")?;
                 for (i, loan) in loans.iter().enumerate() {
                     if i > 0 {
@@ -99,6 +91,8 @@ impl<'a, 'b> Printer<'a, 'b> {
                     self.loan(&loan)?;
                 }
                 self.lit("}")?;
+                self.space()?;
+                self.lit("mut")?;
                 self.space()?;
                 self.ty(ty)
             }
@@ -122,7 +116,12 @@ impl<'a, 'b> Printer<'a, 'b> {
         if self.verbose {
             self.lit("(")?;
         }
-        self.local(&place.local)?;
+        self.lit(&place.local.id)?;
+        if self.verbose {
+            self.lit(":")?;
+            self.ty(&place.local.ty)?;
+            self.lit(")")?;
+        }
         for elem in &place.elems {
             match elem {
                 ast::PlaceElem::Index(i) => {
@@ -130,14 +129,10 @@ impl<'a, 'b> Printer<'a, 'b> {
                     self.lit(&i)?;
                 }
                 ast::PlaceElem::Deref => {
-                    self.lit(".*")?;
+                    self.lit(".")?;
+                    self.lit("deref")?;
                 }
             }
-        }
-        if self.verbose {
-            self.lit(")")?;
-            self.lit(":")?;
-            self.ty(&place.ty())?;
         }
         Ok(())
     }
@@ -147,29 +142,34 @@ impl<'a, 'b> Printer<'a, 'b> {
         self.space()?;
         self.lit(&f.id)?;
         self.lit("(")?;
-        self.typed_locals(&f.params)?;
+        self.locals(&f.params)?;
         self.lit(")")?;
-        self.lit(":")?;
+        self.space()?;
+        self.lit("->")?;
         self.space()?;
         self.ty(&f.ty)?;
         self.space()?;
-        self.ast_block(&f.body)
+        self.ast_block(&f.block)
     }
 
-    fn typed_local(&mut self, l: &Local) -> std::fmt::Result {
-        self.local(l)?;
+    fn local(&mut self, l: &Local) -> std::fmt::Result {
+        if l.mutable {
+            self.lit("mut")?;
+            self.space()?;
+        }
+        self.lit(&l.id)?;
         self.lit(":")?;
         self.space()?;
         self.ty(&l.ty)
     }
 
-    fn typed_locals(&mut self, locals: &[Local]) -> std::fmt::Result {
+    fn locals(&mut self, locals: &[Local]) -> std::fmt::Result {
         for (i, l) in locals.iter().enumerate() {
             if i > 0 {
                 self.lit(",")?;
                 self.space()?;
             }
-            self.typed_local(l)?;
+            self.local(l)?;
         }
         Ok(())
     }
@@ -179,9 +179,10 @@ impl<'a, 'b> Printer<'a, 'b> {
         self.space()?;
         self.lit(&f.id)?;
         self.lit("(")?;
-        self.typed_locals(&f.params)?;
+        self.locals(&f.params)?;
         self.lit(")")?;
-        self.lit(":")?;
+        self.space()?;
+        self.lit("->")?;
         self.space()?;
         self.ty(&f.ty)?;
         self.space()?;
@@ -191,11 +192,14 @@ impl<'a, 'b> Printer<'a, 'b> {
             self.newline()?;
             self.lit("let")?;
             self.space()?;
-            self.typed_local(l)?;
+            self.local(l)?;
             self.lit(";")?;
         }
-        for block in &f.blocks {
-            self.newline()?;
+        self.newline()?;
+        for (i, block) in f.blocks.iter().enumerate() {
+            if i > 0 {
+                self.newline()?;
+            }
             self.mir_block(block)?;
         }
         self.indent_level -= 1;
@@ -208,60 +212,108 @@ impl<'a, 'b> Printer<'a, 'b> {
             ast::Stmt::Let(l, e) => {
                 self.lit("let")?;
                 self.space()?;
-                self.local(l)?;
+                self.lit(&l.id)?;
                 self.lit(":")?;
                 self.space()?;
                 self.ty(&l.ty)?;
-                self.space()?;
-                self.lit("=")?;
-                self.space()?;
-                self.expr(e)
+                if let Some(e) = e {
+                    self.space()?;
+                    self.lit("=")?;
+                    self.space()?;
+                    self.expr(e)?;
+                }
             }
-            ast::Stmt::Expr(e) => self.expr(e),
+            ast::Stmt::Expr(e) => {
+                self.expr(e)?;
+            }
         }
+        Ok(())
     }
 
     fn mir_stmt(&mut self, stmt: &Stmt) -> std::fmt::Result {
+        // self.newline()?;
+        // self.lit("//")?;
+        // self.space()?;
+        // self.lit(" live_in =")?;
+        // self.space()?;
+        // self.lit("[")?;
+        // self.places(&stmt.live_in.as_slice())?;
+        // self.lit("]")?;
+        // self.newline()?;
         match &stmt.op {
             Operation::Assign(place, rvalue) => {
                 self.place(place)?;
                 self.space()?;
                 self.lit("=")?;
                 self.space()?;
-                self.rvalue(rvalue)
+                self.rvalue(rvalue)?;
             }
             Operation::StorageLive(l) => {
                 self.lit("StorageLive")?;
                 self.lit("(")?;
                 self.lit(&l.id)?;
-                self.lit(")")
+                self.lit(")")?;
             }
             Operation::StorageDead(l) => {
                 self.lit("StorageDead")?;
                 self.lit("(")?;
                 self.lit(&l.id)?;
-                self.lit(")")
+                self.lit(")")?;
             }
-            Operation::Call {
-                dest: destination,
-                func,
-                args,
-            } => {
-                self.place(destination)?;
+            Operation::Call { dest, func, args } => {
+                self.place(dest)?;
                 self.space()?;
                 self.lit("=")?;
                 self.space()?;
                 self.operand(func)?;
-                for arg in args {
-                    self.space()?;
+                self.lit("(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.lit(",")?;
+                        self.space()?;
+                    }
                     self.operand(arg)?;
                 }
-                Ok(())
+                self.lit(")")?;
             }
+            Operation::Noop => {}
         }
+        self.lit(";")?;
+        if self.verbose {
+            self.newline()?;
+            self.lit("//")?;
+            self.space()?;
+            self.lit("live_out =")?;
+            self.space()?;
+            self.lit("[")?;
+            self.places(&stmt.live_out.as_slice())?;
+            self.lit("]")?;
+            self.newline()?;
+        }
+        Ok(())
+    }
+
+    fn dom(&mut self, block: &BasicBlock) -> std::fmt::Result {
+        if self.verbose {
+            self.lit("//")?;
+            self.space()?;
+            self.lit("dom")?;
+            self.lit("(")?;
+            for (i, dom) in block.dom.iter().enumerate() {
+                if i > 0 {
+                    self.lit(",")?;
+                    self.space()?;
+                }
+                self.lit(&dom)?;
+            }
+            self.lit(")")?;
+            self.newline()?;
+        }
+        Ok(())
     }
 
     fn mir_block(&mut self, block: &BasicBlock) -> std::fmt::Result {
+        self.dom(block)?;
         self.lit("bb")?;
         self.lit(&block.id)?;
         self.lit(":")?;
@@ -271,25 +323,11 @@ impl<'a, 'b> Printer<'a, 'b> {
         for stmt in &block.stmts {
             self.newline()?;
             self.mir_stmt(stmt)?;
-            self.lit(";")?;
-            self.space()?;
-            self.lit("//")?;
-            self.space()?;
-            self.lit("live_in =")?;
-            self.space()?;
-            self.lit("[")?;
-            self.places(&stmt.live_in)?;
-            self.lit("],")?;
-            self.space()?;
-            self.lit("live_out =")?;
-            self.space()?;
-            self.lit("[")?;
-            self.places(&stmt.live_out)?;
-            self.lit("]")?;
         }
         if let Some(ref terminator) = block.terminator {
             self.newline()?;
             self.terminator(terminator)?;
+            self.lit(";")?;
         }
         self.indent_level -= 1;
         self.newline()?;
@@ -315,8 +353,10 @@ impl<'a, 'b> Printer<'a, 'b> {
             self.ast_stmt(stmt)?;
             self.lit(";")?;
         }
-        self.newline()?;
-        self.expr(&block.expr)?;
+        if let Some(e) = &block.expr {
+            self.newline()?;
+            self.expr(e)?;
+        }
         self.indent_level -= 1;
         self.newline()?;
         self.lit("}")
@@ -328,6 +368,7 @@ impl<'a, 'b> Printer<'a, 'b> {
             Terminator::Goto(block_id) => {
                 self.lit("goto")?;
                 self.space()?;
+                self.lit("bb")?;
                 self.lit(&block_id)
             }
             Terminator::ConditionalGoto(cond, block_id1, block_id2) => {
@@ -337,12 +378,14 @@ impl<'a, 'b> Printer<'a, 'b> {
                 self.space()?;
                 self.lit("goto")?;
                 self.space()?;
+                self.lit("bb")?;
                 self.lit(&block_id1)?;
                 self.space()?;
                 self.lit("else")?;
                 self.space()?;
                 self.lit("goto")?;
                 self.space()?;
+                self.lit("bb")?;
                 self.lit(&block_id2)
             }
         }
@@ -352,10 +395,10 @@ impl<'a, 'b> Printer<'a, 'b> {
         match rvalue {
             Rvalue::Use(operand) => self.operand(operand),
             Rvalue::Ref { mutable, place } => {
+                self.lit("&")?;
                 if *mutable {
-                    self.lit("&mut")?;
-                } else {
-                    self.lit("&")?;
+                    self.lit("mut")?;
+                    self.space()?;
                 }
                 self.place(place)
             }
@@ -364,18 +407,20 @@ impl<'a, 'b> Printer<'a, 'b> {
 
     fn operand(&mut self, operand: &Operand) -> std::fmt::Result {
         match operand {
-            Operand::Constant(c) => self.constant(c),
+            Operand::Constant(c) => {
+                self.lit("const")?;
+                self.space()?;
+                self.constant(c)
+            }
             Operand::Copy(place) => {
                 self.lit("copy")?;
-                self.lit("(")?;
-                self.place(place)?;
-                self.lit(")")
+                self.space()?;
+                self.place(place)
             }
             Operand::Move(place) => {
                 self.lit("move")?;
-                self.lit("(")?;
-                self.place(place)?;
-                self.lit(")")
+                self.space()?;
+                self.place(place)
             }
             Operand::Function(name) => self.lit(&name),
         }
@@ -383,11 +428,22 @@ impl<'a, 'b> Printer<'a, 'b> {
 
     fn constant(&mut self, c: &Constant) -> std::fmt::Result {
         match c {
-            Constant::Int(i) => self.lit(i),
-            Constant::Bool(b) => self.lit(b),
-            Constant::String(s) => self.lit(&s),
-            Constant::Unit => self.lit("()"),
+            Constant::Int(i) => {
+                self.lit(i)?;
+            }
+            Constant::Bool(b) => {
+                self.lit(b)?;
+            }
+            Constant::String(s) => {
+                self.lit("\"")?;
+                self.lit(&s)?;
+                self.lit("\"")?;
+            }
+            Constant::Unit => {
+                self.lit("()")?;
+            }
         }
+        Ok(())
     }
 
     fn expr(&mut self, e: &Expr) -> std::fmt::Result {
@@ -395,28 +451,10 @@ impl<'a, 'b> Printer<'a, 'b> {
             self.lit("(")?;
         }
         match e {
-            // Expr::Let(_, l, e1, e2) => {
-            //     self.lit("let")?;
-            //     self.space()?;
-            //     self.local(l)?;
-            //     self.lit(":")?;
-            //     self.space()?;
-            //     self.ty(&l.ty)?;
-            //     self.space()?;
-            //     self.lit("=")?;
-            //     self.space()?;
-            //     self.expr(e1)?;
-            //     self.space()?;
-            //     self.lit("in")?;
-            //     self.space()?;
-            //     self.expr(e2)?;
-            // }
             Expr::IfElse(_, e1, b2, b3) => {
                 self.lit("if")?;
                 self.space()?;
                 self.expr(e1)?;
-                self.space()?;
-                self.lit("then")?;
                 self.space()?;
                 self.ast_block(b2)?;
                 self.space()?;
@@ -449,7 +487,9 @@ impl<'a, 'b> Printer<'a, 'b> {
                 self.place(place)?;
             }
             Expr::RefMut(_, place) => {
-                self.lit("&mut")?;
+                self.lit("&")?;
+                self.lit("mut")?;
+                self.space()?;
                 self.place(place)?;
             }
             Expr::Seq(_, e1, e2) => {
@@ -462,13 +502,11 @@ impl<'a, 'b> Printer<'a, 'b> {
                 self.lit(")")?;
             }
             Expr::Assign(_, place, e) => {
-                self.lit("assign")?;
-                self.lit("(")?;
                 self.place(place)?;
-                self.lit(",")?;
+                self.space()?;
+                self.lit("=")?;
                 self.space()?;
                 self.expr(e)?;
-                self.lit(")")?;
             }
             Expr::Place(_, p) => {
                 self.place(p)?;
@@ -489,13 +527,52 @@ impl<'a, 'b> Printer<'a, 'b> {
                 self.lit(b)?;
             }
             Expr::String(_, s) => {
+                self.lit("\"")?;
                 self.lit(&s)?;
+                self.lit("\"")?;
             }
             Expr::Block(_, b) => {
                 self.ast_block(b)?;
             }
             Expr::Unit(_) => {
                 self.lit("()")?;
+            }
+            Expr::Print(_, e) => {
+                self.lit("print")?;
+                self.lit("(")?;
+                self.expr(e)?;
+                self.lit(")")?;
+            }
+            Expr::Return(_, e) => {
+                self.lit("return")?;
+                self.space()?;
+                self.expr(e)?;
+            }
+            Expr::Loop(_, l, b) => {
+                self.lit("loop")?;
+                if let Some(l) = l {
+                    self.space()?;
+                    self.lit("'")?;
+                    self.lit(&l)?;
+                }
+                self.space()?;
+                self.ast_block(b)?;
+            }
+            Expr::Continue(_, l) => {
+                self.lit("continue")?;
+                if let Some(l) = l {
+                    self.space()?;
+                    self.lit("'")?;
+                    self.lit(&l)?;
+                }
+            }
+            Expr::Break(_, l) => {
+                self.lit("break")?;
+                if let Some(l) = l {
+                    self.space()?;
+                    self.lit("'")?;
+                    self.lit(&l)?;
+                }
             }
         }
         if self.verbose {
@@ -513,7 +590,7 @@ impl std::fmt::Display for ast::Function {
     }
 }
 
-impl std::fmt::Display for crate::mir::Function {
+impl std::fmt::Display for mir::Function {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         Printer::new(f).mir_function(self)
     }
@@ -528,6 +605,12 @@ impl<'a> std::fmt::Display for Loan {
 impl<'a> std::fmt::Display for Place {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         Printer::new(f).place(self)
+    }
+}
+
+impl<'a> std::fmt::Display for Stmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Printer::new(f).mir_stmt(self)
     }
 }
 
@@ -557,11 +640,23 @@ impl Place {
     }
 }
 
+impl Local {
+    pub fn verbose(&self) -> Verbose<&Local> {
+        Verbose(&self)
+    }
+}
+
 impl<'a> std::fmt::Display for Verbose<&'a ast::Function> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let mut printer = Printer::new(f);
         printer.verbose = true;
         printer.ast_function(&self.0)
+    }
+}
+
+impl mir::Stmt {
+    pub fn verbose(&self) -> Verbose<&Stmt> {
+        Verbose(&self)
     }
 }
 
@@ -586,5 +681,28 @@ impl std::fmt::Display for Verbose<&Place> {
         let mut printer = Printer::new(f);
         printer.verbose = true;
         printer.place(&self.0)
+    }
+}
+
+impl std::fmt::Display for Verbose<&Local> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut printer = Printer::new(f);
+        printer.verbose = true;
+        printer.local(&self.0)
+    }
+}
+
+impl std::fmt::Display for Verbose<&Stmt> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut printer = Printer::new(f);
+        printer.verbose = true;
+        printer.mir_stmt(&self.0)
+    }
+}
+
+impl mir::Function {
+    pub fn inspect(self) -> Self {
+        println!("{}", self.verbose());
+        self
     }
 }

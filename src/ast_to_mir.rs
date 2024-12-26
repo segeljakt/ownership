@@ -1,5 +1,8 @@
+use std::rc::Rc;
+
 use crate::ast;
 use crate::ast::Expr;
+use crate::ast::Loan;
 use crate::ast::Local;
 use crate::ast::Place;
 use crate::ast::PlaceElem;
@@ -13,15 +16,19 @@ use crate::mir::Operation;
 use crate::mir::Rvalue;
 use crate::mir::Stmt;
 use crate::mir::Terminator;
+use crate::set::Set;
 
 pub struct Context {
     func: mir::Function,
     temp_counter: usize,
     stack: Vec<Scope>,
+    loops: Vec<(BlockId, BlockId)>,
 }
 
-struct Scope {
+#[derive(Debug)]
+pub struct Scope {
     locals: Vec<Local>,
+    subst: Vec<(Local, Local)>,
 }
 
 impl Context {
@@ -30,6 +37,7 @@ impl Context {
             func: function,
             temp_counter: 0,
             stack: vec![],
+            loops: vec![],
         }
     }
 }
@@ -45,320 +53,369 @@ impl ast::Function {
                 id: 0,
                 terminator: None,
                 stmts: vec![],
-                live_in: vec![],
-                live_out: vec![],
+                live_in: Set::new(),
+                live_out: Set::new(),
+                dom: Set::new(),
             }],
+            domtree: vec![],
+            successors: vec![],
+            predecessors: vec![],
+            postorder: vec![],
+            preorder: vec![],
+            reverse_postorder_number: vec![],
         };
         let mut ctx = Context::new(func);
-        ctx.push_scope();
         let l0 = ctx.new_local(self.ty);
-        let (b1, l1) = ctx.lower_block(&self.body, 0);
-        let r = ctx.use_local(l1);
-        ctx.func.blocks[b1].stmts.push(Stmt::new(Operation::Assign(
-            Place {
-                local: l0.clone(),
-                elems: vec![],
-            },
-            r,
-        )));
-        ctx.pop_scope();
-        ctx.func.blocks[b1].terminator = Some(Terminator::Return);
+        ctx.scoped(|ctx| {
+            let (b1, o1) = ctx.lower_block(&self.block, 0);
+            ctx.func.blocks[b1].stmts.push(Stmt::new(Operation::Assign(
+                Place::from(l0.clone()),
+                Rvalue::Use(o1.clone()),
+            )));
+            ctx.func.blocks[b1]
+                .terminator
+                .get_or_insert(Terminator::Return);
+            (b1, o1)
+        });
         ctx.func
     }
 }
 
 impl Context {
-    pub fn push_scope(&mut self) {
-        self.stack.push(Scope { locals: vec![] });
+    fn push_scope(&mut self) {
+        self.stack.push(Scope {
+            locals: vec![],
+            subst: vec![],
+        });
     }
 
-    fn pop_scope(&mut self) -> Scope {
-        self.stack.pop().unwrap()
+    fn push_loop(&mut self, b_continue: BlockId, b_break: BlockId) {
+        self.loops.push((b_continue, b_break))
     }
 
-    pub fn add_storage_live(&mut self, l: Local) {
-        self.func
-            .blocks
-            .last_mut()
-            .unwrap()
-            .stmts
-            .push(Stmt::new(Operation::StorageLive(l.clone())));
+    fn get_loop(&mut self) -> (BlockId, BlockId) {
+        *self.loops.last().unwrap()
     }
 
-    pub fn add_storage_dead(&mut self, l: Local) {
-        // Only add storage dead if the value was not moved
-        self.func
-            .blocks
-            .last_mut()
-            .unwrap()
-            .stmts
-            .push(Stmt::new(Operation::StorageDead(l.clone())));
+    fn get_return_local(&mut self) -> &Local {
+        self.func.locals.first().unwrap()
     }
 
-    pub fn lower_block(&mut self, b: &ast::Block, b0: BlockId) -> (BlockId, Local) {
+    fn pop_loop(&mut self) {
+        self.loops.pop();
+    }
+
+    fn rename(&mut self, l1: Local, l2: Local) {
+        self.stack.last_mut().unwrap().subst.push((l1, l2));
+    }
+
+    fn lookup(&self, l0: Local) -> Option<&Local> {
+        self.stack.iter().rev().find_map(|scope| {
+            scope
+                .subst
+                .iter()
+                .find_map(|(l1, l2)| if l0.id == *l1.id { Some(l2) } else { None })
+        })
+    }
+
+    fn scoped(&mut self, f: impl FnOnce(&mut Self) -> (BlockId, Operand)) -> (BlockId, Operand) {
         self.push_scope();
+        let (b, o) = f(self);
+        self.pop_scope(b);
+        (b, o)
+    }
+
+    fn pop_scope(&mut self, b: mir::BlockId) {
+        let scope = self.stack.pop().unwrap();
+        for l in scope.locals.into_iter().rev() {
+            self.func.blocks[b]
+                .stmts
+                .push(Stmt::new(Operation::StorageDead(l)));
+        }
+    }
+
+    pub fn lower_block(&mut self, b: &ast::Block, b0: mir::BlockId) -> (BlockId, Operand) {
         let b1 = b.stmts.iter().fold(b0, |b1, s| match s {
-            ast::Stmt::Let(l, e) => {
-                let (b1, l1) = self.lower_expr(e, b1);
-                let r = self.use_local(l1);
-                self.func.blocks[b1].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l.clone(),
-                        elems: vec![],
-                    },
-                    r,
-                )));
-                b1
+            ast::Stmt::Let(l0, e0) => {
+                if let Some(e0) = e0 {
+                    let (b1, o1) = self.lower_expr(e0, b1);
+                    let l1 = self.new_storage_local(l0.ty.clone(), b1);
+                    self.rename(l0.clone(), l1.clone());
+                    self.func.blocks[b1].stmts.push(Stmt::new(Operation::Assign(
+                        Place::from(l1.clone()),
+                        Rvalue::Use(o1),
+                    )));
+                    b1
+                } else {
+                    todo!()
+                }
             }
             ast::Stmt::Expr(e) => {
                 let (b1, _) = self.lower_expr(e, b1);
                 b1
             }
         });
-        let e = self.lower_expr(&b.expr, b1);
-        for l in self.pop_scope().locals {
-            self.add_storage_dead(l);
+        if let Some(e) = &b.expr {
+            self.lower_expr(e, b1)
+        } else {
+            (b1, Operand::Constant(Constant::Unit))
         }
-        e
     }
+
+    /// TODO: This should return an Option so that we can short-circuit when we return.
     /// Returns the current block and the local that holds the result of the expression.
-    pub fn lower_expr(&mut self, e: &Expr, b0: BlockId) -> (BlockId, Local) {
+    pub fn lower_expr(&mut self, e: &Expr, b0: BlockId) -> (BlockId, Operand) {
         match e {
-            Expr::Int(t, v) => {
-                let l = self.new_live_local(t.clone());
-                self.func.blocks[b0].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l.clone(),
-                        elems: vec![],
-                    },
-                    Rvalue::Use(Operand::Constant(Constant::Int(*v))),
-                )));
-                (b0, l)
-            }
-            // Lower addition as a call to a built-in
+            Expr::Int(_, v) => (b0, Operand::Constant(Constant::Int(*v))),
             Expr::Add(t, e0, e1) => {
-                let (b0, l0) = self.lower_expr(e0, b0);
-                let (b1, l1) = self.lower_expr(e1, b0);
-                let l2 = self.new_live_local(t.clone());
+                let (b0, a0) = self.lower_expr(e0, b0);
+                let (b1, a1) = self.lower_expr(e1, b0);
+                let l2 = self.new_storage_local(t.clone(), b1);
                 self.func.blocks[b1].stmts.push(Stmt::new(Operation::Call {
-                    dest: Place {
-                        local: l2.clone(),
-                        elems: vec![],
-                    },
+                    dest: Place::from(l2.clone()),
                     func: Operand::Function("add".to_string()),
-                    args: vec![
-                        Operand::Copy(Place {
-                            local: l0.clone(),
-                            elems: vec![],
-                        }),
-                        Operand::Copy(Place {
-                            local: l1.clone(),
-                            elems: vec![],
-                        }),
-                    ],
+                    args: vec![a0, a1],
                 }));
-                (b1, l2)
+                let a2 = Operand::from(l2);
+                (b1, a2)
             }
             Expr::IfElse(t, e0, e1, e2) => {
-                let (b0, l0) = self.lower_expr(e0, b0);
+                let (b0, o0) = self.lower_expr(e0, b0);
                 let b1_start = self.new_block();
                 let b2_start = self.new_block();
+                let b3 = self.new_block();
+                let l3 = self.new_storage_local(t.clone(), b0);
 
                 self.func.blocks[b0]
                     .terminator
-                    .replace(Terminator::ConditionalGoto(
-                        Operand::Copy(Place {
-                            local: l0.clone(),
-                            elems: vec![],
-                        }),
-                        b1_start,
-                        b2_start,
-                    ));
+                    .get_or_insert(Terminator::ConditionalGoto(o0, b1_start, b2_start));
 
-                let (b1, l1) = self.lower_block(e1, b1_start);
-                let (b2, l2) = self.lower_block(e2, b2_start);
+                self.scoped(|ctx| {
+                    let (b1, l1) = ctx.lower_block(e1, b1_start);
+                    ctx.func.blocks[b1].stmts.push(Stmt::new(Operation::Assign(
+                        Place::from(l3.clone()),
+                        Rvalue::Use(l1.clone()),
+                    )));
+                    ctx.func.blocks[b1]
+                        .terminator
+                        .get_or_insert(Terminator::Goto(b3));
+                    (b1, l1)
+                });
 
-                let b3 = self.new_block();
-                let l3 = self.new_live_local(t.clone());
+                self.scoped(|ctx| {
+                    let (b2, l2) = ctx.lower_block(e2, b2_start);
+                    ctx.func.blocks[b2].stmts.push(Stmt::new(Operation::Assign(
+                        Place::from(l3.clone()),
+                        Rvalue::Use(l2.clone()),
+                    )));
+                    ctx.func.blocks[b2]
+                        .terminator
+                        .get_or_insert(Terminator::Goto(b3));
+                    (b2, l2)
+                });
 
-                self.func.blocks[b1]
-                    .terminator
-                    .replace(Terminator::Goto(b3));
-                self.func.blocks[b2]
-                    .terminator
-                    .replace(Terminator::Goto(b3));
-
-                let r = self.use_local(l1);
-                self.func.blocks[b1].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l3.clone(),
-                        elems: vec![],
-                    },
-                    r,
-                )));
-
-                let r = self.use_local(l2);
-                self.func.blocks[b2].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l3.clone(),
-                        elems: vec![],
-                    },
-                    r,
-                )));
-
-                (b3, l3)
+                (b3, Operand::from(l3))
             }
             Expr::While(_, e0, e1) => {
-                let b0_start = self.new_block();
-                let b1_start = self.new_block();
-                let b2_start = self.new_block();
+                let b_header = self.new_block();
+                let b_body = self.new_block();
+                let b_after = self.new_block();
+
+                self.push_loop(b_header, b_after);
 
                 self.func.blocks[b0]
                     .terminator
-                    .replace(Terminator::Goto(b0_start));
+                    .get_or_insert(Terminator::Goto(b_header));
 
-                let (b0, l0) = self.lower_expr(e0, b0_start);
+                let (b0, l0) = self.lower_expr(e0, b_header);
 
                 self.func.blocks[b0]
                     .terminator
-                    .replace(Terminator::ConditionalGoto(
-                        Operand::Copy(Place {
-                            local: l0.clone(),
-                            elems: vec![],
-                        }),
-                        b1_start,
-                        b2_start,
-                    ));
+                    .get_or_insert(Terminator::ConditionalGoto(l0, b_body, b_after));
 
-                let (b1, _) = self.lower_block(e1, b1_start);
+                self.scoped(|ctx| {
+                    let (b1, l1) = ctx.lower_block(e1, b_body);
+                    ctx.func.blocks[b1]
+                        .terminator
+                        .get_or_insert(Terminator::Goto(b_header));
+                    (b1, l1)
+                });
 
-                self.func.blocks[b1]
+                self.pop_loop();
+
+                (b_after, Operand::Constant(Constant::Unit))
+            }
+            Expr::Loop(_, _, e1) => {
+                let b_body = self.new_block();
+                let b_after = self.new_block();
+
+                self.push_loop(b_body, b_after);
+
+                self.func.blocks[b0]
                     .terminator
-                    .replace(Terminator::Goto(b0_start));
+                    .get_or_insert(Terminator::Goto(b_body));
 
-                let l2 = self.new_live_local(Type::Unit);
-                self.func.blocks[b2_start]
-                    .stmts
-                    .push(Stmt::new(Operation::Assign(
-                        Place {
-                            local: l2.clone(),
-                            elems: vec![],
-                        },
-                        Rvalue::Use(Operand::Constant(Constant::Unit)),
-                    )));
-                (b2_start, l2)
+                self.scoped(|ctx| {
+                    let (b1, l1) = ctx.lower_block(e1, b_body);
+                    ctx.func.blocks[b1]
+                        .terminator
+                        .get_or_insert(Terminator::Goto(b_body));
+                    (b1, l1)
+                });
+
+                self.pop_loop();
+
+                (b_after, Operand::Constant(Constant::Unit))
             }
             Expr::Tuple(t, es) => {
-                let l0 = self.new_live_local(t.clone());
+                let l0 = self.new_storage_local(t.clone(), b0);
                 let b0 = es.iter().enumerate().fold(b0, |b0, (i, e)| {
                     let (b1, l1) = self.lower_expr(e, b0);
-                    let r = self.use_local(l1);
                     self.func.blocks[b1].stmts.push(Stmt::new(Operation::Assign(
                         Place {
                             local: l0.clone(),
                             elems: vec![PlaceElem::Index(i)],
                         },
-                        r,
+                        Rvalue::Use(l1),
                     )));
                     b1
                 });
-                (b0, l0)
+                (b0, Operand::from(l0))
             }
-            Expr::Ref(t, p) => {
-                let l = self.new_live_local(t.clone());
+            Expr::Ref(t, p0) => {
+                let l = self.new_storage_local(t.clone(), b0);
+                let p1 = self.resolve_place(p0.clone());
                 self.func.blocks[b0].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l.clone(),
-                        elems: vec![],
-                    },
+                    Place::from(l.clone()),
                     Rvalue::Ref {
                         mutable: false,
-                        place: p.clone(),
+                        place: p1.clone(),
                     },
                 )));
-                (b0, l)
+                (b0, Operand::from(l))
             }
-            Expr::RefMut(t, p) => {
-                let l = self.new_live_local(t.clone());
+            Expr::RefMut(t, p0) => {
+                let l = self.new_storage_local(t.clone(), b0);
+                let p1 = self.resolve_place(p0.clone());
                 self.func.blocks[b0].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l.clone(),
-                        elems: vec![],
-                    },
+                    Place::from(l.clone()),
                     Rvalue::Ref {
                         mutable: true,
-                        place: p.clone(),
+                        place: p1.clone(),
                     },
                 )));
-                (b0, l)
+                (b0, Operand::from(l))
             }
-            Expr::Place(t0, p0) => {
-                let l0 = self.new_live_local(t0.clone());
-                let r = self.use_place(p0.clone());
-                self.func.blocks[b0].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l0.clone(),
-                        elems: vec![],
-                    },
-                    r,
-                )));
-                (b0, l0)
+            Expr::Place(_, p0) => {
+                let p1 = self.resolve_place(p0.clone());
+                (b0, Operand::from(p1))
             }
             Expr::Seq(_, e0, e1) => {
                 let (b0, _) = self.lower_expr(e0, b0);
                 self.lower_expr(e1, b0)
             }
             Expr::Assign(_, p0, e0) => {
+                let p0 = self.resolve_place(p0.clone());
                 let (b0, l0) = self.lower_expr(e0, b0);
-                let r = self.use_local(l0);
                 self.func.blocks[b0]
                     .stmts
-                    .push(Stmt::new(Operation::Assign(p0.clone(), r)));
-                let l1 = self.new_live_local(Type::Unit);
-                self.func.blocks[b0].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l1.clone(),
-                        elems: vec![],
-                    },
-                    Rvalue::Use(Operand::Constant(Constant::Unit)),
-                )));
-                (b0, l1)
+                    .push(Stmt::new(Operation::Assign(p0, Rvalue::Use(l0))));
+                (b0, Operand::Constant(Constant::Unit))
             }
-            Expr::Bool(t, v) => {
-                let l = self.new_live_local(t.clone());
-                self.func.blocks[b0].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l.clone(),
-                        elems: vec![],
-                    },
-                    Rvalue::Use(Operand::Constant(Constant::Bool(*v))),
-                )));
-                (b0, l)
+            Expr::Bool(_, v) => (b0, Operand::Constant(Constant::Bool(*v))),
+            Expr::String(_, v) => (b0, Operand::Constant(Constant::String(v.clone()))),
+            Expr::Block(_, b) => self.scoped(|ctx| ctx.lower_block(b, b0)),
+            Expr::Unit(_) => (b0, Operand::Constant(Constant::Unit)),
+            Expr::Print(t, e0) => {
+                let (b0, l0) = self.lower_expr(e0, b0);
+                let l1 = self.new_storage_local(t.clone(), b0);
+                self.func.blocks[b0].stmts.push(Stmt::new(Operation::Call {
+                    dest: Place::from(l1),
+                    func: Operand::Function("print".to_string()),
+                    args: vec![l0],
+                }));
+                (b0, Operand::Constant(Constant::Unit))
             }
-            Expr::String(t, v) => {
-                let l0 = self.new_live_local(t.clone());
+            Expr::Return(_, e0) => {
+                let (b0, l0) = self.lower_expr(e0, b0);
+                let l1 = self.get_return_local().clone();
                 self.func.blocks[b0].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l0.clone(),
-                        elems: vec![],
-                    },
-                    Rvalue::Use(Operand::Constant(Constant::String(v.clone()))),
+                    Place::from(l1),
+                    Rvalue::from(l0),
                 )));
-                (b0, l0)
+                self.func.blocks[b0]
+                    .terminator
+                    .get_or_insert(Terminator::Return);
+                (b0, Operand::Constant(Constant::Unit))
             }
-            Expr::Block(_, b) => self.lower_block(b, b0),
-            Expr::Unit(t) => {
-                let l0 = self.new_live_local(t.clone());
-                self.func.blocks[b0].stmts.push(Stmt::new(Operation::Assign(
-                    Place {
-                        local: l0.clone(),
-                        elems: vec![],
-                    },
-                    Rvalue::Use(Operand::Constant(Constant::Unit)),
-                )));
-                (b0, l0)
+            Expr::Continue(_, _) => {
+                let (b_continue, _) = self.get_loop();
+                self.func.blocks[b0]
+                    .terminator
+                    .get_or_insert(Terminator::Goto(b_continue));
+                (b0, Operand::Constant(Constant::Unit))
+            }
+            Expr::Break(_, _) => {
+                let (_, b_break) = self.get_loop();
+                self.func.blocks[b0]
+                    .terminator
+                    .get_or_insert(Terminator::Goto(b_break));
+                (b0, Operand::Constant(Constant::Unit))
             }
         }
+    }
+
+    fn resolve_place(&mut self, p0: Place) -> Place {
+        if let Some(l) = self.lookup(p0.local.clone()) {
+            let p1 = Place {
+                local: l.clone(),
+                elems: p0.elems.clone(),
+            };
+            p1.clone()
+        } else {
+            p0.clone()
+        }
+    }
+
+    fn resolve_type(&mut self, t: Type) -> Type {
+        match t {
+            Type::Tuple(ts) => {
+                let ts = ts.into_iter().map(|t| self.resolve_type(t)).collect();
+                Type::Tuple(ts)
+            }
+            Type::Ref(loans, t) => {
+                let loans = loans
+                    .into_iter()
+                    .map(|l| Loan {
+                        place: self.resolve_place(l.place),
+                        mutable: l.mutable,
+                    })
+                    .collect();
+                let t = self.resolve_type(t.as_ref().clone());
+                Type::Ref(loans, Rc::new(t))
+            }
+
+            Type::RefMut(loans, t) => {
+                let loans = loans
+                    .into_iter()
+                    .map(|l| Loan {
+                        place: self.resolve_place(l.place),
+                        mutable: l.mutable,
+                    })
+                    .collect();
+                let t = self.resolve_type(t.as_ref().clone());
+                Type::RefMut(loans, Rc::new(t))
+            }
+            _ => t,
+        }
+    }
+
+    fn new_storage_local(&mut self, ty: Type, b: BlockId) -> Local {
+        let l = self.new_local(ty);
+        self.func.blocks[b]
+            .stmts
+            .push(Stmt::new(Operation::StorageLive(l.clone())));
+        l
     }
 
     fn new_local(&mut self, ty: Type) -> Local {
@@ -366,17 +423,13 @@ impl Context {
         self.temp_counter += 1;
         let l = Local {
             id: format!("_{}", id).into(),
-            ty,
+            ty: self.resolve_type(ty),
             mutable: false,
         };
-        self.stack.last_mut().unwrap().locals.push(l.clone());
         self.func.locals.push(l.clone());
-        l
-    }
-
-    fn new_live_local(&mut self, ty: Type) -> Local {
-        let l = self.new_local(ty);
-        self.add_storage_live(l.clone());
+        if let Some(scope) = self.stack.last_mut() {
+            scope.locals.push(l.clone());
+        }
         l
     }
 
@@ -386,32 +439,51 @@ impl Context {
             id: block_id,
             stmts: Vec::new(),
             terminator: None,
-            live_in: Vec::new(),
-            live_out: Vec::new(),
+            live_in: Set::new(),
+            live_out: Set::new(),
+            dom: Set::new(),
         });
         block_id
     }
+}
 
-    pub fn use_local(&mut self, l: Local) -> Rvalue {
-        if l.ty.is_copy() {
-            Rvalue::Use(Operand::Copy(Place {
-                local: l,
-                elems: vec![],
-            }))
+impl From<Place> for Operand {
+    fn from(place: Place) -> Operand {
+        if place.ty().is_copy() {
+            Operand::Copy(place)
         } else {
-            self.stack.last_mut().unwrap().locals.retain(|x| x != &l);
-            Rvalue::Use(Operand::Move(Place {
-                local: l,
-                elems: vec![],
-            }))
+            Operand::Move(place)
         }
     }
+}
 
-    pub fn use_place(&mut self, p: Place) -> Rvalue {
-        if p.ty().is_copy() {
-            Rvalue::Use(Operand::Copy(p))
-        } else {
-            Rvalue::Use(Operand::Move(p))
+impl From<Local> for Place {
+    fn from(local: Local) -> Place {
+        Place {
+            local,
+            elems: vec![],
         }
+    }
+}
+
+impl From<Local> for Operand {
+    fn from(local: Local) -> Operand {
+        if local.ty.is_copy() {
+            Operand::Copy(Place {
+                local,
+                elems: vec![],
+            })
+        } else {
+            Operand::Move(Place {
+                local,
+                elems: vec![],
+            })
+        }
+    }
+}
+
+impl From<Operand> for Rvalue {
+    fn from(op: Operand) -> Rvalue {
+        Rvalue::Use(op)
     }
 }

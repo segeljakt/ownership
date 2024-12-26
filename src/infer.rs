@@ -40,13 +40,16 @@ impl Context {
         for l in &f.params {
             self.add_binding(l.clone());
         }
-        let body = self.infer_block(&f.body);
+        let body = self.infer_block(&f.block);
+        if *body.ty() != f.ty {
+            panic!("Function: mismatched types: {:?} != {:?}", body.ty(), f.ty);
+        }
         self.stack.pop();
         Function {
             id: f.id.clone(),
             params: f.params.clone(),
             ty: f.ty.clone(),
-            body,
+            block: body,
         }
     }
 
@@ -67,14 +70,14 @@ impl Context {
             Expr::IfElse(_, e0, e1, e2) => {
                 let e0 = self.infer_expr(e0);
                 if *e0.ty() != Type::Bool {
-                    panic!("expected bool, found {:?}", e0.ty());
+                    panic!("IfElse: expected bool, found {:?}", e0.ty());
                 }
                 let b1 = self.infer_block(e1);
                 let b2 = self.infer_block(e2);
-                let ty = match (b1.expr.ty(), e2.expr.ty()) {
+                let ty = match (b1.ty(), b2.ty()) {
                     (Type::Ref(loans1, t1), Type::Ref(loans2, t2)) => {
                         if t1 != t2 {
-                            panic!("mismatched types: {:?} != {:?}", t1, t2);
+                            panic!("IfElse (Ref): mismatched types: {:?} != {:?}", t1, t2);
                         }
                         let loans = loans1
                             .iter()
@@ -85,7 +88,7 @@ impl Context {
                     }
                     (Type::RefMut(loans1, t1), Type::RefMut(loans2, t2)) => {
                         if t1 != t2 {
-                            panic!("mismatched types: {:?} != {:?}", t1, t2);
+                            panic!("IfElse (RefMut) mismatched types: {:?} != {:?}", t1, t2);
                         }
                         let loans = loans1
                             .iter()
@@ -96,24 +99,13 @@ impl Context {
                     }
                     (t1, t2) => {
                         if t1 != t2 {
-                            panic!("mismatched types: {:?} != {:?}", t1, t2);
+                            panic!("IfElse (Type) mismatched types: {:?} != {:?}", t1, t2);
                         }
                         t1.clone()
                     }
                 };
                 Expr::IfElse(ty, Rc::new(e0), Rc::new(b1), Rc::new(b2))
             }
-            // Expr::Let(_, l0, e0, e1) => {
-            //     let e0 = self.infer_expr(e0);
-            //     let l1 = Local {
-            //         id: l0.id.clone(),
-            //         ty: e0.ty().clone(),
-            //         mutable: l0.mutable,
-            //     };
-            //     self.add_binding(l1.clone());
-            //     let e1 = self.infer_expr(e1);
-            //     Expr::Let(e0.ty().clone(), l1, Rc::new(e0), Rc::new(e1))
-            // }
             Expr::While(_, e, b) => {
                 let e = self.infer_expr(e);
                 if *e.ty() != Type::Bool {
@@ -157,16 +149,35 @@ impl Context {
                 }
                 let e = self.infer_expr(e);
                 if p.ty() != e.ty() {
-                    panic!("mismatched types: {:?} != {:?}", p.ty(), e.ty());
+                    panic!("Assign: mismatched types: {:?} != {:?}", p.ty(), e.ty());
                 }
                 Expr::Assign(Type::Unit, p, Rc::new(e))
             }
             Expr::String(_, s) => Expr::String(Type::String, s.clone()),
             Expr::Block(_, b) => {
                 let b = self.infer_block(b);
-                Expr::Block(b.expr.ty().clone(), Rc::new(b))
+                Expr::Block(b.ty().clone(), Rc::new(b))
             }
             Expr::Unit(_) => Expr::Unit(Type::Unit),
+            Expr::Print(_, e) => {
+                let e = self.infer_expr(e);
+                if let Type::Ref(_, t) = e.ty().downgrade() {
+                    if *t.as_ref() == Type::String {
+                        return Expr::Print(Type::Unit, Rc::new(e));
+                    }
+                }
+                panic!("Print: expected string, found {:?}", e.ty());
+            }
+            Expr::Return(_, e) => {
+                let e = self.infer_expr(e);
+                Expr::Return(e.ty().clone(), Rc::new(e))
+            }
+            Expr::Loop(_, l, b) => {
+                let b = self.infer_block(b);
+                Expr::Loop(b.ty().clone(), *l, Rc::new(b))
+            }
+            Expr::Continue(_, _) => Expr::Continue(Type::Unit, None),
+            Expr::Break(_, _) => Expr::Break(Type::Unit, None),
         }
     }
 
@@ -177,14 +188,18 @@ impl Context {
             .iter()
             .map(|s| match s {
                 Stmt::Let(l, e) => {
-                    let e = self.infer_expr(e);
-                    let l = Local {
-                        id: l.id.clone(),
-                        ty: e.ty().clone(),
-                        mutable: l.mutable,
-                    };
-                    self.add_binding(l.clone());
-                    Stmt::Let(l, e)
+                    if let Some(e) = e {
+                        let e = self.infer_expr(e);
+                        let l = Local {
+                            id: l.id.clone(),
+                            ty: e.ty().clone(),
+                            mutable: l.mutable,
+                        };
+                        self.add_binding(l.clone());
+                        Stmt::Let(l, Some(e))
+                    } else {
+                        todo!()
+                    }
                 }
                 Stmt::Expr(e) => {
                     let e = self.infer_expr(e);
@@ -192,8 +207,8 @@ impl Context {
                 }
             })
             .collect::<Vec<_>>();
+        let expr = b.expr.as_ref().map(|e| self.infer_expr(e));
         self.stack.pop();
-        let expr = self.infer_expr(&b.expr);
         Block { stmts, expr }
     }
 
@@ -201,9 +216,9 @@ impl Context {
         let local = Local {
             id: p.local.id.clone(),
             ty: self.lookup(&p.local.id).unwrap().ty.clone(),
-            mutable: false,
+            mutable: p.local.mutable,
         };
-        let elems = p.elems.iter().map(|e| e.clone()).collect();
+        let elems = p.elems.clone();
         Place { local, elems }
     }
 }

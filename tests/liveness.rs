@@ -2,10 +2,8 @@ use ownership_v4::ast::Function;
 
 #[test]
 fn test() {
-    let f = Function::parse("fn f(): int = let x = 1 in x;")
-        .unwrap()
-        .into_mir()
-        .compute_liveness();
-
-    println!("{}", f);
+    let f = Function::parse("fn f() -> i32 { let x = 1; x }").unwrap().infer();
+    println!("{f}");
+    let f = f.into_mir().with_liveness();
+    println!("{f}");
 }

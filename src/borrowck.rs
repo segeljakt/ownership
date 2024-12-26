@@ -1,7 +1,6 @@
 use crate::ast::Loan;
 use crate::ast::Place;
 use crate::mir::Function;
-use crate::mir::Operand;
 use crate::mir::Operation;
 use crate::mir::Rvalue;
 
@@ -18,46 +17,39 @@ impl<'a> Context<'a> {
         for block in &self.function.blocks {
             for stmt in &block.stmts {
                 match &stmt.op {
-                    Operation::Assign(p, r) => {
+                    Operation::Assign(lhs, rhs) => {
                         let loan = Loan {
-                            place: p.clone(),
+                            place: lhs.clone(),
                             mutable: true,
                         };
                         if !self.permits(&stmt.live_out, &loan) {
                             panic!("Borrowck error");
                         }
-                        match r {
-                            Rvalue::Use(o) => match o {
-                                Operand::Constant(_) => {}
-                                Operand::Copy(_) => {}
-                                Operand::Move(p) => {
-                                    let loan = Loan {
-                                        place: p.clone(),
-                                        mutable: false,
-                                    };
-                                    if !self.permits(&stmt.live_out, &loan) {
-                                        panic!("Borrowck error");
-                                    }
-                                }
-                                Operand::Function(_) => {}
-                            },
-                            Rvalue::Ref { mutable: _, place } => {
-                                if !stmt.live_out.contains(place) {
-                                    panic!(
-                                        "Borrowck error: reference to a dead variable {}",
-                                        place
-                                    );
+                        match rhs {
+                            Rvalue::Use(_) => {}
+                            Rvalue::Ref { mutable, place } => {
+                                let loan = Loan {
+                                    place: place.clone(),
+                                    mutable: *mutable,
+                                };
+                                if !self.permits(&stmt.live_in, &loan) {
+                                    panic!("Borrowck error");
                                 }
                             }
                         }
                     }
-                    Operation::StorageLive(_) => {}
-                    Operation::StorageDead(_) => {}
-                    Operation::Call {
-                        dest: _,
-                        func: _,
-                        args: _,
-                    } => {}
+                    Operation::StorageLive(..) => {}
+                    Operation::StorageDead(..) => {}
+                    Operation::Call { dest, .. } => {
+                        let loan = Loan {
+                            place: dest.clone(),
+                            mutable: true,
+                        };
+                        if !self.permits(&stmt.live_in, &loan) {
+                            panic!("Borrowck error");
+                        }
+                    }
+                    Operation::Noop => {}
                 }
             }
         }
@@ -65,7 +57,7 @@ impl<'a> Context<'a> {
 
     fn permits(&self, live_out: &[Place], loan1: &Loan) -> bool {
         for place in live_out {
-            for loan2 in place.ty().loans() {
+            for loan2 in place.local.ty.loans() {
                 if !self.compatible(loan1, &loan2) {
                     return false;
                 }

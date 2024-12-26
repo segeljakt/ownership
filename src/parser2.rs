@@ -1,75 +1,95 @@
-use crate::ast::Block;
-use crate::ast::Expr;
-use crate::ast::Function;
-use crate::ast::Loan;
-use crate::ast::Local;
-use crate::ast::Place;
-use crate::ast::PlaceElem;
-use crate::ast::Stmt;
-use crate::ast::Type;
+use crate::cst::Block;
+use crate::cst::Expr;
+use crate::cst::Function;
+use crate::cst::Loan;
+use crate::cst::Local;
+use crate::cst::Place;
+use crate::cst::PlaceElem;
+use crate::cst::Stmt;
+use crate::cst::Type;
+use crate::lexer::Lexer;
+use crate::token::Spanned;
+use crate::token::Token;
 use std::rc::Rc;
 
-pub struct Parser<'a> {
+impl Token {
+    fn bp(self, prefix: bool) -> Option<(u8, u8)> {
+        let res = match self {
+            Token::Number | Token::Ident => (99, 100),
+            Token::LeftParen => (99, 0),
+            Token::RightParen => (0, 100),
+            Token::Equal => (2, 1),
+            Token::Plus | Token::Minus | Token::Star if prefix => (99, 9),
+            Token::Plus | Token::Minus => (5, 6),
+            Token::Star | Token::Slash => (7, 8),
+            _ => return None,
+        };
+        Some(res)
+    }
+}
+
+struct Frame {
+    min_bp: u8,
+    lhs: Option<Expr>,
+    token: Option<Token>,
+}
+
+pub struct Parser<'a, I: Iterator<Item = Spanned<Token>>> {
     input: &'a str,
+    lexer: std::iter::Peekable<I>,
     pos: usize,
 }
 
-impl<'a> Parser<'a> {
-    pub fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+impl<'a, I: Iterator<Item = Spanned<Token>>> Parser<'a, I> {
+    pub fn new(input: &'a str, iter: I) -> Self {
+        Self {
+            input,
+            lexer: iter.peekable(),
+            pos: 0,
+        }
     }
 
     fn parse_expr(&mut self) -> Option<Expr> {
-        self.skip_whitespace();
-        if self.at("if") {
-            self.parse_ifelse()
-        } else if self.at("while") {
-            self.parse_while()
-        } else if self.at("loop") {
-            self.parse_loop()
-        } else if self.at("break") {
-            self.parse_break()
-        } else if self.at("continue") {
-            self.parse_continue()
-        } else if self.at("print") {
-            self.consume("print")?;
-            self.consume("(")?;
-            let expr = self.parse_expr()?;
-            self.consume(")")?;
-            Some(Expr::Print(Type::Unknown, Rc::new(expr)))
-        } else if self.at("add") {
-            self.parse_add()
-        } else if self.at("assign") {
-            self.consume("assign(")?;
-            let place = self.parse_place()?;
-            self.consume(",")?;
-            let value = self.parse_expr()?;
-            self.consume(")")?;
-            Some(Expr::Assign(Type::Unknown, place, Rc::new(value)))
-        } else if self.at("(") {
-            self.parse_tuple_expr()
-        } else if self.consume("&mut").is_some() {
-            let place = self.parse_place()?;
-            Some(Expr::RefMut(Type::Unknown, place))
-        } else if self.consume("&").is_some() {
-            let place = self.parse_place()?;
-            Some(Expr::Ref(Type::Unknown, place))
-        } else if self.consume("seq(").is_some() {
-            let first = self.parse_expr()?;
-            self.consume(",")?;
-            let second = self.parse_expr()?;
-            self.consume(")")?;
-            Some(Expr::Seq(Type::Unknown, Rc::new(first), Rc::new(second)))
-        } else {
-            if let Some(lit) = self.parse_literal() {
-                Some(lit)
-            } else {
-                if let Some(place) = self.parse_place() {
-                    Some(Expr::Place(Type::Unknown, place))
-                } else {
-                    panic!("Invalid expression");
+        let mut top = Frame {
+            min_bp: 0,
+            lhs: None,
+            token: None,
+        };
+        let mut stack = Vec::new();
+        loop {
+            let token = self.lexer.next();
+            let r_bp = loop {
+                if let Some(ref token) = token {
+                    match token.data.bp(top.lhs.is_none()) {
+                        Some((lbp, rbp)) if top.min_bp <= lbp => break rbp,
+                        _ => {}
+                    }
+                    let res = top;
+                    top = match stack.pop() {
+                        Some(top) => top,
+                        None => return res.lhs,
+                    };
+                    match top.token.unwrap() {
+                        Token::Number => {
+                            let value = self.input[token.span()].parse().unwrap();
+                            top.lhs = Some(Expr::Int(Type::Int, value));
+                        }
+                        Token::Ident => {
+                            let id = &self.input[token.span()];
+                            top.lhs = Some(Expr::Var(Type::Unknown, id.to_string()));
+                        }
+                        Token::String => {
+                            let text = &self.input[token.span()];
+                            top.lhs = Some(Expr::String(Type::Unknown, text.to_string()));
+                        }
+                        Token::LeftParen => {
+                            let rhs = res.lhs?;
+                            top.lhs = Some(rhs);
+                        }
+                        _ => return None,
+                    }
                 }
-            }
+            };
         }
     }
 
@@ -85,18 +105,14 @@ impl<'a> Parser<'a> {
         } else {
             Type::Unknown
         };
+        self.consume("=")?;
+        let expr = self.parse_expr()?;
         let local = Local {
             id: name,
             ty,
             mutable,
         };
-        if self.at("=") {
-            self.consume("=")?;
-            let expr = self.parse_expr()?;
-            Some(Stmt::Let(local, Some(expr)))
-        } else {
-            Some(Stmt::Let(local, None))
-        }
+        Some(Stmt::Let(local, Some(expr)))
     }
 
     fn parse_ifelse(&mut self) -> Option<Expr> {
@@ -118,22 +134,6 @@ impl<'a> Parser<'a> {
         let cond = self.parse_expr()?;
         let body = self.parse_block()?;
         Some(Expr::While(Type::Unknown, Rc::new(cond), Rc::new(body)))
-    }
-
-    fn parse_loop(&mut self) -> Option<Expr> {
-        self.consume("loop")?;
-        let body = self.parse_block()?;
-        Some(Expr::Loop(Type::Unknown, None, Rc::new(body)))
-    }
-
-    fn parse_continue(&mut self) -> Option<Expr> {
-        self.consume("continue")?;
-        Some(Expr::Continue(Type::Unknown, None))
-    }
-
-    fn parse_break(&mut self) -> Option<Expr> {
-        self.consume("break")?;
-        Some(Expr::Break(Type::Unknown, None))
     }
 
     fn parse_add(&mut self) -> Option<Expr> {
@@ -186,7 +186,7 @@ impl<'a> Parser<'a> {
     pub fn parse_function(&mut self) -> Option<Function> {
         self.consume("fn")?;
         self.skip_whitespace();
-        let id = self.parse_identifier()?;
+        let name = self.parse_identifier()?;
         self.consume("(")?;
         let mut params = Vec::new();
         while self.consume(")").is_none() {
@@ -206,12 +206,12 @@ impl<'a> Parser<'a> {
         } else {
             Type::Unit
         };
-        let body = self.parse_block()?;
+        let block = self.parse_block()?;
         Some(Function {
-            id,
+            id: name,
             params,
             ty,
-            block: body,
+            block,
         })
     }
 
@@ -288,7 +288,6 @@ impl<'a> Parser<'a> {
 
     fn parse_type(&mut self) -> Option<Type> {
         if self.consume("&").is_some() {
-            self.consume("{")?;
             let mut loans = Vec::new();
 
             loop {
@@ -317,7 +316,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            self.consume("}")?;
+            self.consume("}")?; // End of loan list
 
             // Determine if it's a mutable or shared reference
             if self.consume("mut").is_some() {
@@ -404,28 +403,30 @@ impl<'a> Parser<'a> {
         Some(Block { stmts, expr: None })
     }
 
-    fn at(&mut self, expected: &str) -> bool {
-        self.skip_whitespace();
-        self.input[self.pos..].starts_with(expected)
+    fn peek(&mut self) -> Option<&Spanned<Token>> {
+        self.lexer.peek()
     }
 
-    fn consume(&mut self, expected: &str) -> Option<()> {
+    fn next(&mut self) -> Option<Spanned<Token>> {
+        self.lexer.next()
+    }
+
+    fn at(&mut self, expected: Token) -> bool {
+        self.skip_whitespace();
+        if self.input[self.pos..].starts_with(expected) {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume(&mut self, expected: Token) -> Option<Spanned<Token>> {
         self.skip_whitespace();
         if self.input[self.pos..].starts_with(expected) {
             self.pos += expected.len();
             Some(())
         } else {
             None
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while let Some(c) = self.peek_char() {
-            if c.is_whitespace() {
-                self.advance();
-            } else {
-                break;
-            }
         }
     }
 
@@ -442,7 +443,8 @@ impl<'a> Parser<'a> {
 
 impl Function {
     pub fn parse(input: &str) -> Option<Self> {
-        let mut parser = Parser::new(input);
+        let mut lexer = Lexer::new(input);
+        let mut parser = Parser::new(input, lexer);
         parser.parse_function()
     }
 }

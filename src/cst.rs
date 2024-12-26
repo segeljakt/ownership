@@ -43,11 +43,14 @@ pub enum Expr {
     While(Type, Rc<Expr>, Rc<Block>),
     Loop(Type, Option<usize>, Rc<Block>),
     Tuple(Type, Vec<Expr>),
-    Ref(Type, Place),
-    RefMut(Type, Place),
+    Ref(Type, Rc<Expr>),
+    RefMut(Type, Rc<Expr>),
     Seq(Type, Rc<Expr>, Rc<Expr>),
-    Assign(Type, Place, Rc<Expr>),
+    Assign(Type, Rc<Expr>, Rc<Expr>),
     Place(Type, Place),
+    Var(Type, String),
+    Index(Type, Rc<Expr>, usize),
+    Deref(Type, Rc<Expr>),
     Add(Type, Rc<Expr>, Rc<Expr>),
     Int(Type, i32),
     Bool(Type, bool),
@@ -134,6 +137,9 @@ impl Expr {
             Expr::Loop(ty, _, _) => ty,
             Expr::Continue(ty, _) => ty,
             Expr::Break(ty, _) => ty,
+            Expr::Var(ty, _) => ty,
+            Expr::Index(ty, _, _) => ty,
+            Expr::Deref(ty, _) => ty,
         }
     }
 }
