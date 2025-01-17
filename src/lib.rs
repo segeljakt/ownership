@@ -16,6 +16,4 @@ pub mod merge_blocks;
 pub mod remove_unreachable;
 pub mod constant_propagation;
 pub mod remove_unused;
-pub mod parser2;
 pub mod cst;
-// pub mod parser2;

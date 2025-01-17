@@ -6,7 +6,7 @@ pub type LocalId = String;
 
 #[derive(Debug, Clone)]
 pub struct Function {
-    pub id: Name,
+    pub name: Name,
     pub params: Vec<Local>,
     pub ty: Type,
     pub block: Block,

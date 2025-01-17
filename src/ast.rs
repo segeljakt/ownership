@@ -223,8 +223,8 @@ impl Type {
     }
 
     pub fn downgrade(&self) -> Type {
-        if let Type::RefMut(_, t) = self {
-            Type::Ref(Vec::new(), t.clone())
+        if let Type::RefMut(loans, t) = self {
+            Type::Ref(loans.clone(), t.clone())
         } else {
             self.clone()
         }
